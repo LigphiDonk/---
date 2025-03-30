@@ -91,6 +91,10 @@ def get_args():
     parser.add_argument('--port', type=int, default=0, help='客户端端口，默认为12000+client_id')
     parser.add_argument('--f', type=int, default=1, help='允许的最大故障节点数')
 
+    # 添加余弦相似度防御相关参数
+    parser.add_argument('--use_cosine_defense', action='store_true', help='使用余弦相似度防御机制')
+    parser.add_argument('--cosine_threshold', type=float, default=-0.22, help='余弦相似度阈值，低于此值的更新将被丢弃（默认：-0.22）')
+
     args = parser.parse_args()
     return args
 
@@ -923,6 +927,14 @@ if __name__ == '__main__':
         
         # 启动客户端
         pbft_client.start()
+        
+        # 设置是否使用掩码
+        pbft_client.set_use_mask(True)
+        
+        # 设置是否使用余弦相似度防御
+        if initial_args.use_cosine_defense:
+            pbft_client.set_cosine_defense(True, initial_args.cosine_threshold)
+            logger.info(f"客户端 {client_id} 启用余弦相似度防御，阈值: {initial_args.cosine_threshold}")
         
         try:
             # 等待初始配置（从引导节点或任何已连接的节点获取）
