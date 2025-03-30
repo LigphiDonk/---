@@ -11,6 +11,7 @@ from consensus import PBFTConsensus
 from election import ElectionManager
 # 导入PVSS工具
 from pvss_utils import PVSSHandler, apply_mask, batch_generate_masks
+from cosine_deviation_grouping import calculate_cosine_deviation, calculate_update_deviation, group_clients_by_deviation, assign_weights_by_deviation
 
 logger = logging.getLogger("PBFTClient")
 
@@ -288,9 +289,10 @@ class PBFTFederatedClient(PBFTNode):
         """提交本地训练的模型更新
         
         1. 计算本地模型与全局模型的差
-        2. 如果启用了余弦相似度防御，检查更新是否可信
-        3. 如果启用了掩码，应用掩码到模型更新
-        4. 将掩码后的更新广播给所有节点
+        2. 计算模型偏离度
+        3. 如果启用了余弦相似度防御，检查更新是否可信
+        4. 如果启用了掩码，应用掩码到模型更新
+        5. 将掩码后的更新广播给所有节点
         """
         if self.model is None or self.local_model is None:
             logger.error(f"客户端 {self.node_id} 尚未接收全局模型或完成本地训练")
@@ -301,6 +303,10 @@ class PBFTFederatedClient(PBFTNode):
         for key in self.local_model.state_dict():
             if key in self.model.state_dict():
                 delta_w[key] = self.local_model.state_dict()[key] - self.model.state_dict()[key]
+        
+        # 计算模型偏离度
+        deviation = self.calculate_model_deviation()
+        logger.info(f"客户端 {self.node_id} 本地模型的偏离度: {deviation:.4f}")
         
         # 如果启用了余弦相似度防御且不是第一轮，检查相似度
         if self.use_cosine_defense and self.previous_global_model and self.current_round > 0:
@@ -327,8 +333,10 @@ class PBFTFederatedClient(PBFTNode):
             "node_id": self.node_id,
             "round": self.current_round,
             "delta_w": masked_delta_w,
+            "deviation": deviation if deviation is not None else 0.5,  # 添加偏离度信息
             "timestamp": time.time(),
-            "proposal_id": proposal_id
+            "proposal_id": proposal_id,
+            "masked": self.use_mask
         }
         
         # 添加到本轮提案
@@ -338,7 +346,7 @@ class PBFTFederatedClient(PBFTNode):
         
         # 广播模型提案
         self.broadcast("MODEL_PROPOSAL", model_proposal)
-        logger.info(f"客户端 {self.node_id} 提交第 {self.current_round} 轮的模型更新")
+        logger.info(f"客户端 {self.node_id} 提交第 {self.current_round} 轮的模型更新，偏离度: {deviation:.4f}")
     
     def aggregate_models(self, round_num: int = None):
         """聚合模型
@@ -380,14 +388,43 @@ class PBFTFederatedClient(PBFTNode):
                 valid_proposals = {}
                 for node_id, model_dict in proposals.items():
                     if node_id in sign_map:
-                        valid_proposals[node_id] = model_dict
+                        valid_proposals[node_id] = model_dict["delta_w"]
                 
-                # 调用安全聚合函数
-                aggregated_model = secure_federated_aggregation(
-                    valid_proposals, 
-                    mask_seed, 
-                    sign_map
-                )
+                # 计算节点偏离度并进行分组（基于新功能）
+                if hasattr(self, 'use_deviation_grouping') and self.use_deviation_grouping:
+                    logger.info("使用基于偏离度的分组聚合机制")
+                    
+                    # 收集每个客户端的偏离度信息
+                    client_deviations = {}
+                    for node_id in valid_proposals:
+                        # 使用节点在提案中存储的偏离度（如果有）
+                        if "deviation" in proposals[node_id]:
+                            client_deviations[node_id] = proposals[node_id]["deviation"]
+                        else:
+                            # 如果没有提前计算的偏离度，使用默认值
+                            client_deviations[node_id] = 0.5  # 默认中间值
+                    
+                    # 对客户端进行分组
+                    client_groups = group_clients_by_deviation(client_deviations)
+                    
+                    # 计算每个客户端的权重
+                    client_weights = assign_weights_by_deviation(client_deviations)
+                    
+                    # 使用分组和权重信息进行聚合
+                    aggregated_model = secure_federated_aggregation(
+                        valid_proposals, 
+                        mask_seed,
+                        sign_map=sign_map,
+                        client_groups=client_groups,
+                        weights=client_weights
+                    )
+                else:
+                    # 使用原始聚合方法
+                    aggregated_model = secure_federated_aggregation(
+                        valid_proposals, 
+                        mask_seed, 
+                        sign_map
+                    )
                 
                 if aggregated_model:
                     logger.info(f"安全聚合成功，聚合了 {len(valid_proposals)} 个模型")
@@ -398,17 +435,28 @@ class PBFTFederatedClient(PBFTNode):
         # 普通聚合（简单平均）
         logger.info(f"使用普通聚合方式（简单平均）聚合 {len(proposals)} 个模型")
         
-        # 初始化聚合模型
-        aggregated_model = copy.deepcopy(list(proposals.values())[0])
+        # 从第一个提案获取模型结构
+        first_node_id = list(proposals.keys())[0]
+        first_proposal = proposals[first_node_id]["delta_w"]
         
-        # 对每个参数求平均
-        for key in aggregated_model.keys():
-            aggregated_model[key] = torch.zeros_like(aggregated_model[key])
-            for model_dict in proposals.values():
-                aggregated_model[key] += model_dict[key]
-            aggregated_model[key] /= len(proposals)
+        # 初始化聚合结果
+        aggregated_result = {}
+        for key in first_proposal.keys():
+            aggregated_result[key] = torch.zeros_like(first_proposal[key])
         
-        return aggregated_model
+        # 求和
+        for node_id, proposal in proposals.items():
+            delta_w = proposal["delta_w"]
+            for key in delta_w.keys():
+                if key in aggregated_result:
+                    aggregated_result[key] += delta_w[key]
+        
+        # 计算平均值
+        for key in aggregated_result:
+            aggregated_result[key] /= len(proposals)
+        
+        logger.info(f"聚合完成，使用 {len(proposals)} 个节点的提案")
+        return aggregated_result
     
     def request_model_aggregation(self):
         """请求模型聚合"""
@@ -718,45 +766,52 @@ class PBFTFederatedClient(PBFTNode):
         logger.info(f"节点 {self.node_id} 设置使用掩码: {use_mask}")
     
     def apply_mask_to_updates(self, delta_w):
-        """应用掩码到模型更新（增量权重）
-        
-        步骤3：应用掩码到模型更新
-        - 从共识达成的sign_map中查找本节点的符号值
-        - 使用mask_seed生成掩码
-        - 对模型更新应用掩码
+        """
+        将掩码应用到模型更新
         
         Args:
-            delta_w: 模型参数更新（字典形式）
+            delta_w: 模型更新（增量权重）
             
         Returns:
-            Dict: 应用掩码后的模型更新
+            Dict[str, torch.Tensor]: 应用掩码后的增量权重
         """
-        if not self.use_mask:
-            logger.info(f"节点 {self.node_id} 未启用掩码，返回原始更新")
-            return delta_w
-        
-        # 从masked_aggregation模块导入函数
-        from masked_aggregation import apply_mask_to_model_update
-        
-        # 获取当前轮次的掩码种子和符号映射
+        # 从共识对象获取当前轮次的掩码种子和符号映射
         mask_seed = self.consensus.get_mask_seed(self.current_round)
         sign_map = self.consensus.get_sign_map(self.current_round)
         
         if mask_seed is None or sign_map is None:
-            logger.warning(f"节点 {self.node_id} 无法获取掩码种子或符号映射，返回原始更新")
+            logger.error(f"客户端 {self.node_id} 无法获取掩码种子或符号映射，无法应用掩码")
             return delta_w
-            
-        # 获取当前节点的符号
+        
+        # 获取该节点对应的符号
         if self.node_id not in sign_map:
-            logger.warning(f"节点 {self.node_id} 不在符号映射中，返回原始更新")
+            logger.error(f"客户端 {self.node_id} 不在符号映射中，无法应用掩码")
             return delta_w
-            
+        
         sign = sign_map[self.node_id]
-        logger.info(f"节点 {self.node_id} 使用掩码种子 {mask_seed} 和符号 {sign} 应用掩码到模型更新")
+        logger.info(f"客户端 {self.node_id} 使用符号 {sign} 应用掩码")
         
-        # 应用掩码到模型更新
-        masked_delta_w = apply_mask_to_model_update(delta_w, mask_seed, sign)
+        # 使用PVSS实用工具应用掩码
+        from pvss_utils import batch_generate_masks_with_hash_commitment
         
+        # 使用哈希承诺生成掩码并应用
+        masks = batch_generate_masks_with_hash_commitment(mask_seed, delta_w, self.node_id, sign=sign)
+        
+        # 将掩码加到增量权重上
+        masked_delta_w = {}
+        for key, param_delta in delta_w.items():
+            masked_delta_w[key] = param_delta + masks[key]
+            
+            # 记录掩码大小信息
+            mask_norm = torch.norm(masks[key]).item()
+            param_norm = torch.norm(param_delta).item()
+            masked_norm = torch.norm(masked_delta_w[key]).item()
+            
+            logger.debug(f"参数 {key}: 掩码范数={mask_norm:.4f}, "
+                        f"参数范数={param_norm:.4f}, "
+                        f"掩码后范数={masked_norm:.4f}")
+        
+        logger.info(f"客户端 {self.node_id} 已应用掩码到 {len(delta_w)} 个模型参数")
         return masked_delta_w
     
     def set_cosine_defense(self, use_defense: bool, threshold: float = -0.1):
@@ -810,4 +865,33 @@ class PBFTFederatedClient(PBFTNode):
             return similarity_score
         except Exception as e:
             logger.error(f"计算余弦相似度时出错: {str(e)}")
-            return None 
+            return None
+    
+    def calculate_model_deviation(self, local_model=None):
+        """
+        计算本地模型与当前全局模型的偏离度
+        
+        Args:
+            local_model: 可选，指定要计算的本地模型，默认使用self.local_model
+            
+        Returns:
+            float: 偏离度 (1 - 余弦相似度)
+        """
+        if local_model is None:
+            local_model = self.local_model
+        
+        if local_model is None or self.model is None:
+            logger.warning(f"客户端 {self.node_id} 无法计算偏离度：缺少本地模型或全局模型")
+            return None
+        
+        return calculate_cosine_deviation(local_model, self.model)
+    
+    def set_deviation_grouping(self, use_deviation_grouping: bool):
+        """
+        设置是否使用基于偏离度的分组
+        
+        Args:
+            use_deviation_grouping: 是否使用基于偏离度的分组
+        """
+        self.use_deviation_grouping = use_deviation_grouping
+        logger.info(f"客户端 {self.node_id} {'启用' if use_deviation_grouping else '禁用'}基于偏离度的分组") 

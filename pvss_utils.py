@@ -350,34 +350,145 @@ class PVSSHandler:
         """
         return self.reconstruct_secret(self.verified_shares) if self.verified_shares else None
 
-def generate_sign_map(node_ids: List[int]) -> Dict[int, int]:
+def generate_hash_commitment(mask_seed, node_id):
     """
-    为节点生成符号映射 (+1 / -1)，确保每4个一组的和为0
+    使用哈希函数生成掩码承诺
     
     Args:
-        node_ids: 节点ID列表
+        mask_seed: 掩码种子
+        node_id: 节点ID
         
     Returns:
-        Dict[int, int]: 节点ID到符号的映射
+        str: 哈希承诺
     """
-    n = len(node_ids)
+    h = hashlib.sha256()
+    h.update(str(mask_seed).encode())
+    h.update(str(node_id).encode())
+    return h.hexdigest()
+
+def generate_sign_map_for_groups(groups: List[List[int]]) -> Dict[int, int]:
+    """
+    为分好组的节点生成符号映射，确保每组内的符号和为0
+    
+    Args:
+        groups: 节点分组, 每组应有4个节点
+        
+    Returns:
+        Dict[int, int]: 节点到符号(+1/-1)的映射
+    """
     sign_map = {}
     
-    # 基础符号组：每四个节点的符号和为0
-    signs = [1, 1, -1, -1]
+    # 对每个组，按照+1,+1,-1,-1的模式分配符号
+    pattern = [1, 1, -1, -1]  # 确保每组符号和为0
     
-    # 随机打乱节点ID以保证公平性
-    shuffled_node_ids = node_ids.copy()
-    random.shuffle(shuffled_node_ids)
+    for group in groups:
+        if len(group) != 4:
+            logger.warning(f"组 {group} 中节点数不是4，可能导致掩码无法完全消除")
+        
+        # 为该组分配符号
+        for i, node_id in enumerate(group):
+            sign_map[node_id] = pattern[i % len(pattern)]
     
-    for i, node_id in enumerate(shuffled_node_ids):
-        sign_map[node_id] = signs[i % 4]
-    
-    # 验证：如果节点数是4的倍数，总和应为0
-    if n % 4 == 0:
-        assert sum(sign_map.values()) == 0, f"符号总和应为0，而不是{sum(sign_map.values())}"
+    # 验证总体符号和
+    sign_sum = sum(sign_map.values())
+    logger.info(f"生成符号映射: {sign_map}, 符号总和: {sign_sum}")
+    assert sign_sum == 0, f"符号映射总和应为0，但实际为{sign_sum}"
     
     return sign_map
+
+# 修改原有的generate_sign_map函数以兼容两种模式
+def generate_sign_map(node_ids_or_groups, is_groups=False):
+    """
+    生成节点的符号映射，确保符号和为0（当节点数是4的倍数时）
+    
+    Args:
+        node_ids_or_groups: 节点ID列表或已分组的节点列表
+        is_groups: 是否已经是分好的组
+        
+    Returns:
+        Dict[int, int]: 节点到符号(+1/-1)的映射
+    """
+    if is_groups:
+        return generate_sign_map_for_groups(node_ids_or_groups)
+    
+    # 以下是原始实现（不基于分组）
+    node_ids = node_ids_or_groups
+    sign_map = {}
+    
+    # 使用固定模式1,1,-1,-1确保每4个节点的符号和为0
+    pattern = [1, 1, -1, -1]
+    
+    for i, node_id in enumerate(node_ids):
+        sign_map[node_id] = pattern[i % len(pattern)]
+    
+    # 验证总体符号和
+    sign_sum = sum(sign_map.values())
+    logger.info(f"生成符号映射: {sign_map}, 符号总和: {sign_sum}")
+    
+    # 如果节点数不是4的倍数，符号和可能不为0
+    if len(node_ids) % 4 != 0 and sign_sum != 0:
+        logger.warning(f"节点数 {len(node_ids)} 不是4的倍数，符号和为 {sign_sum}，掩码可能无法完全消除")
+    
+    return sign_map
+
+def generate_mask_with_hash_commitment(mask_seed: Any, param_tensor: torch.Tensor, node_id: int, sign: int = 1) -> torch.Tensor:
+    """
+    使用哈希承诺生成确定性掩码
+    
+    Args:
+        mask_seed: 掩码种子
+        param_tensor: 参数张量，定义掩码的形状和类型
+        node_id: 节点ID，用于哈希承诺
+        sign: 符号 (+1 或 -1)，默认为 +1
+        
+    Returns:
+        torch.Tensor: 生成的掩码
+    """
+    # 生成哈希承诺
+    commitment = generate_hash_commitment(mask_seed, node_id)
+    
+    # 使用哈希承诺的前8位作为随机种子
+    seed_int = int(commitment[:8], 16)
+    
+    # 设置随机种子
+    torch.manual_seed(seed_int)
+    
+    # 存储原始数据类型
+    original_dtype = param_tensor.dtype
+    
+    # 将参数转换为浮点类型以生成掩码
+    float_tensor = param_tensor.float()
+    
+    # 生成与param_tensor形状相同、类型为浮点的随机掩码
+    mask = torch.randn_like(float_tensor)
+    
+    # 将掩码转换回原始数据类型
+    if original_dtype != torch.float32:
+        mask = mask.to(original_dtype)
+    
+    # 根据符号调整掩码
+    return sign * mask
+
+def batch_generate_masks_with_hash_commitment(mask_seed: Any, model_state_dict: Dict[str, torch.Tensor], node_id: int, sign: int = 1) -> Dict[str, torch.Tensor]:
+    """
+    使用哈希承诺批量生成与模型状态字典形状匹配的掩码
+    
+    Args:
+        mask_seed: 掩码种子
+        model_state_dict: 模型状态字典
+        node_id: 节点ID，用于哈希承诺
+        sign: 符号 (+1 或 -1)，默认为 1
+        
+    Returns:
+        Dict[str, torch.Tensor]: 掩码字典，与模型状态字典结构相同
+    """
+    masks = {}
+    for key, param in model_state_dict.items():
+        # 使用参数名作为额外的种子部分
+        param_seed = f"{mask_seed}_{key}"
+        masks[key] = generate_mask_with_hash_commitment(param_seed, param, node_id, sign=sign)
+    
+    return masks
 
 def generate_mask(seed: Any, param_tensor: torch.Tensor, sign: int = 1) -> torch.Tensor:
     """

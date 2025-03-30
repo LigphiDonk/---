@@ -157,6 +157,10 @@ def get_args():
     parser.add_argument('--use_cosine_defense', action='store_true', help='使用余弦相似度防御机制')
     parser.add_argument('--cosine_threshold', type=float, default=-0.22, help='余弦相似度阈值，低于此值的更新将被丢弃（默认：-0.22）')
     
+    # 添加偏离度分组和哈希承诺相关参数
+    parser.add_argument('--use_deviation_grouping', action='store_true', help='使用基于偏离度的分组机制')
+    parser.add_argument('--use_hash_commitment', action='store_true', help='使用哈希承诺替代PVSS承诺')
+    
     args = parser.parse_args()
     return args
 
@@ -326,72 +330,88 @@ def get_partition_dict(dataset, partition, n_parties, init_seed=0, datadir='./da
     return net_dataidx_map
 
 def start_bootstrap_node(args, bootstrap_id=0):
-    """启动一个引导节点，初始化网络和模型"""
-    logger.info(f"启动PBFT引导节点 (ID: {bootstrap_id})")
+    """启动引导节点"""
+    logger.info(f"启动引导节点(ID={bootstrap_id})...")
     
-    # 初始化模型
-    model = init_model(args)
+    # 设置随机种子
+    seed = args.init_seed
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    random.seed(seed)
     
-    # 创建数据分区
-    logger.info(f"为 {args.n_parties} 个节点创建数据分区...")
-    net_dataidx_map = get_partition_dict(
-        args.dataset, 
-        args.partition, 
-        args.n_parties, 
-        args.init_seed, 
-        args.datadir, 
-        './logs', 
-        args.beta
-    )
+    # 从args中获取一些配置参数
+    n_parties = args.n_parties
+    use_mask = args.use_mask
+    f = args.f
+    use_cosine_defense = args.use_cosine_defense
+    cosine_threshold = args.cosine_threshold
+    use_deviation_grouping = getattr(args, 'use_deviation_grouping', False)
+    use_hash_commitment = getattr(args, 'use_hash_commitment', False)
     
-    # 创建PBFT客户端作为引导节点
-    bootstrap = PBFTFederatedClient(
+    # 打印一些配置信息
+    logger.info(f"配置参数: n_parties={n_parties}, use_mask={use_mask}, f={f}")
+    if use_cosine_defense:
+        logger.info(f"启用余弦相似度防御，阈值={cosine_threshold}")
+    
+    if use_deviation_grouping:
+        logger.info(f"启用基于偏离度的分组机制")
+    
+    if use_hash_commitment:
+        logger.info(f"使用哈希承诺替代PVSS承诺")
+    
+    # 创建引导节点
+    client = PBFTFederatedClient(
         node_id=bootstrap_id,
         host='127.0.0.1',
-        port=12000 + bootstrap_id
+        port=12000 + bootstrap_id  # 默认端口从12000开始
     )
     
-    # 设置验证节点集合初始值（仅引导节点）
-    bootstrap.consensus.set_validators({bootstrap_id})
-    bootstrap.set_as_validator(True)
-    bootstrap.set_as_primary(True)
-    
-    # 设置初始模型
-    bootstrap.set_model(model)
+    # 设置为primary
+    client.set_as_primary(True)
     
     # 设置训练配置
-    config = {
-        "args": args,
-        "net_dataidx_map": net_dataidx_map
+    train_config = {
+        'model': args.model,
+        'dataset': args.dataset,
+        'epochs': args.epochs,
+        'batch_size': args.batch_size,
+        'lr': args.lr,
+        'optimizer': args.optimizer,
+        'comm_round': args.comm_round,
+        'n_parties': n_parties,
+        'use_mask': use_mask,
+        'f': f,
+        'use_cosine_defense': use_cosine_defense,
+        'cosine_threshold': cosine_threshold,
+        'use_deviation_grouping': use_deviation_grouping,
+        'use_hash_commitment': use_hash_commitment
     }
-    bootstrap.set_training_config(config)
     
-    # 设置数据
-    dataidxs = net_dataidx_map[bootstrap_id]
-    train_dl, test_dl, _, _ = get_dataloader(
-        args.dataset, 
-        args.datadir, 
-        args.batch_size, 
-        32, 
-        dataidxs
-    )
-    bootstrap.set_data(train_dl, test_dl)
+    client.set_training_config(train_config)
     
-    # 设置PVSS掩码开关
-    bootstrap.set_use_mask(args.use_mask)
+    # 设置是否使用掩码
+    client.set_use_mask(use_mask)
     
     # 设置是否使用余弦相似度防御
-    if args.use_cosine_defense:
-        bootstrap.set_cosine_defense(True, args.cosine_threshold)
-        logger.info(f"引导节点 {bootstrap_id} 启用余弦相似度防御，阈值: {args.cosine_threshold}")
+    if use_cosine_defense:
+        client.set_cosine_defense(True, cosine_threshold)
     
-    # 启动引导节点
-    bootstrap.start()
+    # 设置是否使用偏离度分组
+    if use_deviation_grouping:
+        client.set_deviation_grouping(True)
     
-    logger.info(f"引导节点 {bootstrap_id} 启动完成，等待其他节点连接...")
+    # 设置validators（包括自己）
+    validators = set(range(n_parties))
+    client.consensus.set_validators(validators)
     
-    # 返回bootstrap节点对象，以便在主程序中控制
-    return bootstrap
+    # 启动客户端
+    client.start()
+    
+    # 打印引导节点信息
+    print_bootstrap_info(bootstrap_id, client.host, client.port)
+    
+    # 返回客户端实例
+    return client
 
 def print_bootstrap_info(bootstrap_id, host='127.0.0.1', port=None):
     """打印引导节点连接信息"""
