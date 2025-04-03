@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+定义模型类用于MNIST分类任务
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -265,26 +271,65 @@ class SimpleCNNMNIST_header(nn.Module):
         return x
 
 class SimpleCNNMNIST(nn.Module):
-    def __init__(self, input_dim, hidden_dims, output_dim=10):
+    """
+    一个简单的CNN模型用于MNIST数据集的分类
+    """
+    def __init__(self, input_dim=None, hidden_dims=None, output_dim=10):
+        """
+        参数:
+            input_dim: 输入维度，用于全连接层
+            hidden_dims: 隐藏层维度列表
+            output_dim: 输出维度 (对于MNIST为10个类别)
+        """
         super(SimpleCNNMNIST, self).__init__()
-        self.conv1 = nn.Conv2d(1, 6, 5)
-        self.pool = nn.MaxPool2d(2, 2)
-        self.conv2 = nn.Conv2d(6, 16, 5)
 
-        # for now, we hard coded this network
-        # i.e. we fix the number of hidden layers i.e. 2 layers
+        self.conv1 = nn.Conv2d(1, 6, kernel_size=5)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.conv2 = nn.Conv2d(6, 16, kernel_size=5)
+        
+        # 默认隐藏层维度
+        if hidden_dims is None:
+            hidden_dims = [120, 84]
+        
+        # 计算全连接层的输入大小
+        # 输入图像尺寸为28x28
+        # 第一个卷积层后变为24x24 (28-5+1)
+        # 第一个池化层后变为12x12
+        # 第二个卷积层后变为8x8 (12-5+1)
+        # 第二个池化层后变为4x4
+        # 通道数为16，所以全连接层的输入大小为16*4*4=256
+        if input_dim is None:
+            input_dim = 16 * 4 * 4
+        
+        # 全连接层
         self.fc1 = nn.Linear(input_dim, hidden_dims[0])
         self.fc2 = nn.Linear(hidden_dims[0], hidden_dims[1])
         self.fc3 = nn.Linear(hidden_dims[1], output_dim)
-
+    
     def forward(self, x):
-        x = self.pool(F.relu(self.conv1(x)))
-        x = self.pool(F.relu(self.conv2(x)))
-        x = x.view(-1, 16 * 4 * 4)
-
+        """
+        前向传播
+        
+        参数:
+            x: 输入图像，形状为[batch_size, 1, 28, 28]
+            
+        返回:
+            输出预测，形状为[batch_size, output_dim]
+        """
+        # 如果输入是未展平的图像
+        if x.dim() == 4:
+            # 卷积和池化
+            x = self.pool(F.relu(self.conv1(x)))
+            x = self.pool(F.relu(self.conv2(x)))
+            
+            # 展平
+            x = x.view(-1, 16 * 4 * 4)
+        
+        # 全连接层
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
+        
         return x
 
 
@@ -318,6 +363,11 @@ class SimpleCNNContainer(nn.Module):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
+        return x
+
+    def forward_conv(self, x):
+        x = self.conv_layer(x)
+        x = x.view(x.size(0), -1)
         return x
 
 
@@ -458,50 +508,6 @@ class ModerateCNNCeleba(nn.Module):
         x = self.conv_layer(x)
         # x = x.view(x.size(0), -1)
         x = x.view(-1, 4096)
-        x = self.fc_layer(x)
-        return x
-
-
-class ModerateCNNMNIST(nn.Module):
-    def __init__(self):
-        super(ModerateCNNMNIST, self).__init__()
-        self.conv_layer = nn.Sequential(
-            # Conv Layer block 1
-            nn.Conv2d(in_channels=1, out_channels=32, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-
-            # Conv Layer block 2
-            nn.Conv2d(in_channels=64, out_channels=128, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels=128, out_channels=128, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Dropout2d(p=0.05),
-
-            # Conv Layer block 3
-            nn.Conv2d(in_channels=128, out_channels=256, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels=256, out_channels=256, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-        )
-
-        self.fc_layer = nn.Sequential(
-            nn.Dropout(p=0.1),
-            nn.Linear(2304, 1024),
-            nn.ReLU(inplace=True),
-            nn.Linear(1024, 512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=0.1),
-            nn.Linear(512, 10)
-        )
-
-    def forward(self, x):
-        x = self.conv_layer(x)
-        x = x.view(x.size(0), -1)
         x = self.fc_layer(x)
         return x
 

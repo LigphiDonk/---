@@ -84,9 +84,36 @@ class FederatedClient:
         Returns:
             websocket: WebSocket连接
         """
+        # 检查环境变量中是否有主服务器端口
+        primary_port = os.environ.get('FL_PRIMARY_SERVER_PORT')
+        if primary_port:
+            self.logger.info(f"从环境变量中获取主服务器端口: {primary_port}")
+            uri = f"ws://{self.config.server_host}:{primary_port}"
+            self.logger.info(f"直接连接到主服务器: {uri}")
+            
+            try:
+                websocket = await websockets.connect(uri)
+                
+                # 发送初始化消息
+                init_msg = Message(
+                    MessageType.INIT,
+                    {"client_id": self.client_id}
+                )
+                await websocket.send(init_msg.to_json())
+                
+                # 接收响应
+                resp = await websocket.recv()
+                resp_msg = Message.from_json(resp)
+                
+                self.logger.info("成功连接到主服务器")
+                return websocket
+            except Exception as e:
+                self.logger.error(f"连接主服务器失败: {str(e)}")
+                # 继续尝试普通连接方式
+        
         # 先尝试连接默认服务器
-        uri = f"ws://{self.config.server_host}:{self.config.server_port}"
-        self.logger.info(f"正在连接到默认服务器: {uri}")
+        uri = f"ws://{self.config.server_host}:{self.config.server_base_port + 1}"  # 连接到服务器1的端口（8766）
+        self.logger.info(f"正在连接到服务器1: {uri}")
         
         try:
             # 更详细的异常捕获和日志记录
@@ -299,6 +326,14 @@ class FederatedClient:
                 # 训练停止
                 self.logger.info("服务器通知停止训练")
                 return None
+            elif msg.type == MessageType.FINISH:
+                # 服务器通知联邦学习已完成
+                message = msg.data.get("message", "联邦学习已完成")
+                self.logger.info(f"收到服务器完成消息: {message}")
+                self.logger.info("===================================")
+                self.logger.info("=== 联邦学习已完成，客户端将退出 ===")
+                self.logger.info("===================================")
+                return None
             else:
                 self.logger.warning(f"收到未知类型的消息: {msg.type}")
                 return None
@@ -387,11 +422,20 @@ async def run_client(client_id, config):
         client_id: 客户端ID
         config: 配置对象
     """
-    # 创建客户端
-    client = FederatedClient(client_id, config)
+    # 设置日志记录器
+    logger = setup_logger(f"Client-{client_id}", os.path.join(config.log_dir, f"client_run_{client_id}.log"))
     
-    # 启动客户端
-    await client.start()
+    try:
+        # 创建客户端
+        client = FederatedClient(client_id, config)
+        
+        # 启动客户端
+        await client.start()
+    except asyncio.CancelledError:
+        # 捕获CancelledError并正常退出
+        logger.info(f"客户端 {client_id} 正在优雅地关闭...")
+    except Exception as e:
+        logger.error(f"客户端 {client_id} 发生错误: {str(e)}")
 
 def main():
     """主函数"""
